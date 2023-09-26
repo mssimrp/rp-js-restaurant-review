@@ -1,10 +1,61 @@
 const express = require('express');
 const mysql = require('mysql2/promise');
+const jwt = require('jsonwebtoken');
 require('dotenv').config();
 
 const app = express();
 // make use of express.json() middleware: enable express to proces json request
 app.use(express.json())
+
+// generate jwt: when the user log in, we want to give them a token
+function generateToken(userId, role) {
+    // first argument: your payload (what do you want to store in the jwt)
+    // second argument: JWT_SECRET
+    // third argument: expiry and other options
+    return jwt.sign({
+        id: userId, role: role
+    }, process.env.JWT_SECRET,{
+        expiresIn:'1h'  // unit of measure: h = hours, m = minutes, d = days, w = weeks, s = seconds
+    });
+}
+
+// verify token: whe the user requests for a protected route
+// we check if the token is valid
+// if a function signature is (req,res,next) it is a middleware
+function verifyToken(req, res, next) {
+    // 1. extract the authorization from the request
+    // the JWT will be inside the authorization header
+    const token = req.headers.authorization.split(" ")[1];
+
+    // verify the token is valid
+    jwt.verify(token, process.env.JWT_SECRET, function(err, payload){
+        if (err) {
+            res.status(401).send("Failed authorization");
+            return; // stop execution
+        }
+
+        // if no error
+        // store in the request the user id and the role
+        // routes will be able to access req.userId and req.role later
+        req.userId = payload.id;
+        req.role = payload.role;
+        next(); // transfer the control to the next middleware !important
+    })
+}
+
+// we assume verifyToken has been called on the request
+function checkRole(roles) {
+    return function(req,res,next) {
+        // includes functione exists on array
+        // [1,2,3].includes(2) ==> true
+        // [1,2,3].includes(-99) ==> false
+        if (roles.includes(req.role)) {
+            next();
+        } else {
+            return res.status(403).send("Permission denied");
+        }
+    }
+}
 
 const pool = mysql.createPool({
     host: process.env.DB_HOST,
@@ -32,7 +83,7 @@ app.get('/reviews', async function(req,res){
 //  - restaurant_name : String
 //  - review_text : String
 //  - rating : float
-app.post('/reviews', async function(req,res){
+app.post('/reviews', verifyToken, async function(req,res){
     const query = `INSERT INTO reviews (restaurant_name, review_text, rating)
        VALUES (?, ?, ?)`;
     await pool.execute(query, [
@@ -44,16 +95,27 @@ app.post('/reviews', async function(req,res){
 })
 
 // PUT - Update a review
-app.put('/reviews/:id', async (req, res) => {
-    const id = req.params.id;
-    const { restaurant_name, review_text, rating } = req.body;
-    const query = `UPDATE reviews 
-                    SET restaurant_name = ?, review_text = ?, rating = ? WHERE id = ?`;
-    await pool.execute(query, [restaurant_name, review_text, rating, id]);
-    
-    // by default res.send assumes status 200
-    res.send('Review updated');
-});
+// body:
+// - restaurant_name
+// - review_text
+// - rating
+app.put('/reviews/:id', [verifyToken, checkRole(["admin", "editor"])], async function(req,res){
+
+
+    const {restaurant_name, review_text, rating} = req.body;
+    await pool.execute(`UPDATE reviews
+        SET restaurant_name = ?,
+            review_text = ?,
+            rating = ?
+        WHERE id = ?
+    `, [restaurant_name, review_text, rating, req.params.id]);
+
+    // by default res.send and res.json assumes status 200
+    res.json({
+        "success": true,
+    })
+})
+
 
 // DELETE - Delete a review
 app.delete('/reviews/:id', async function(req,res){
@@ -64,6 +126,29 @@ app.delete('/reviews/:id', async function(req,res){
     res.json({
         "success": true
     })
+})
+
+
+
+// log in
+// - body
+//   - username: username of the user
+//   - password: password of the user
+app.post('/login', async function(req,res){
+    const { username, password} = req.body;
+    const query = "SELECT * FROM users WHERE username=?";
+    const [results] = await pool.execute(query, [username]);
+    const user = results[0];
+    // check if the user with the given username exists
+    if (user && user.password == password) {
+        // save to the JWT payload the id and the role of the user
+        const token = generateToken(user.id, user.role);
+        res.json({
+            token
+        })
+    } else {
+        res.sendStatus(401);
+    }
 })
 
 app.listen(8080, function(){
